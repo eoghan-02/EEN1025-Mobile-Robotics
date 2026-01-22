@@ -15,17 +15,26 @@ const int rampStep   = 2;     // PWM increment per
 int AnalogValue[5] = {0, 0, 0, 0, 0};
 int AnalogPin[5]   = {4, 5, 6, 7, 15};  // TCRT5000 outputs
 
-// ===== PID variables for line following =====
+
+//=======================CALIBRATION VARIABLES==============================
+
+//Light levels 
+const int nodeLightLevel = 2500;
+const int lostLightLevel = 800;
+
+//Speed
+int baseSpeedTarget = 180;
+
+//PID variables 
 float Kp = 70;   
 float Ki = 0.0;
 float Kd = 12.0;
 
+//============================================================================
+
 float error        = 0;
 float previousError = 0;
 float integral      = 0;
-
-// Target base speed 
-int baseSpeedTarget = 120;    // 0–255
 
 bool lineLost = false;
 int lastTurnDir = -1;
@@ -34,7 +43,8 @@ int nodeCount = 0;
 unsigned long lastNodeTime = 0;
 const int NODE_DEBOUNCE_MS = 350;   // ms
 const int NODE_COUNT_TH = 4;        // >=4 sensors see line => node marker
-const int nodeLightLevel = 2500;
+
+
 
 void setup() {
   Serial.begin(9600);
@@ -61,15 +71,15 @@ void loop() {
   lineFollowStep();
 }
 
-/* -------------------- SENSOR + PID FUNCTIONS -------------------- */
+//SENSOR + PID FUNCTIONS 
 
 void readSensorsAndPrint() {
   for (int i = 0; i < 5; i++) {
     AnalogValue[i] = analogRead(AnalogPin[i]);
-  //  Serial.print(AnalogValue[i]);
-  //  Serial.print("\t");
+    Serial.print(AnalogValue[i]);
+    Serial.print("\t");
   }
-//serial.Println();
+Serial.println();
 }
 
 // Convert 5 sensor readings into a line position error
@@ -91,13 +101,12 @@ float getLineError() {
     denominator += value;
   }
 
-  if (denominator<4000) {
-    // No line detected 
-    lineLost = true;
-    return 0;
-  }
+  lineLost = lineLostFun();
+
+  if (lineLost) return previousError;
+
+  if (denominator == 0) return 0;
   
-  lineLost = false;
   float pos = (float)numerator / (float)denominator;  // range approx -2 … +2
 
   if(pos>0){
@@ -157,13 +166,9 @@ void lineFollowStep() {
   analogWrite(motor1PWM, leftSpeed);
   analogWrite(motor2PWM, rightSpeed);
 
-  // Debug (optional)
-  // Serial.print("Err: "); Serial.print(lineError);
-  // Serial.print("  L: "); Serial.print(leftSpeed);
-  // Serial.print("  R: "); Serial.println(rightSpeed);
 }
 
-/* -------------------- OTHER MOTION FUNCTIONS (OPTIONAL) -------------------- */
+//Motor Movement Functions 
 
 void Brake(int time) {
   baseSpeedCurrent = 0;
@@ -216,6 +221,19 @@ int countSensorsOnLine() {
   return count;
 }
 
+bool lineLostFun(){
+  int cnt = 0;
+
+  for (int i=0; i<5; i++){
+    int inv = 4095- AnalogValue[i]; 
+    if (inv < lostLightLevel) cnt++;
+
+    if (cnt == 5){
+      return true;
+    } 
+  }
+  return false;
+}
 
 bool nodeDetected() {
   if (millis() - lastNodeTime < NODE_DEBOUNCE_MS) return false;
