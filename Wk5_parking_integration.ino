@@ -394,7 +394,7 @@ void driveStraightUntilObstacle() {
         Serial.print("Distance (cm): ");
         Serial.println(distance);
 
-        if (distance <= 12.0) {
+        if (distance <= 6.0) {
             Brake(0);
             break;
         }
