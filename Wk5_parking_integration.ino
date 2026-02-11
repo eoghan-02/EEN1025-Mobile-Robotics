@@ -392,7 +392,7 @@ float readUltrasoundCm() {
 void driveStraightUntilObstacle() {
     while (!nodeDetected()) {
         lineFollowStep();
-        delay(50);
+        delay(250);
     }
 
     while (true) {
@@ -1024,7 +1024,7 @@ void advanceCase(CaseState nextCase, bool enteringFromStart) {
           if (lastCase == CASE_3 || lastCase == CASE_4) flip180();
         }
         else if (parking == true) {
-          if (lastCase != CASE_0 && lastCase != CASE_2) flip180();
+          if (lastCase == CASE_3 || lastCase == CASE_4) flip180();
         }
         break;
 
