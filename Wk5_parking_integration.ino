@@ -466,6 +466,7 @@ void loop() {
 
   // Detect the first node for starting CASE 0
   if (!startedRoute && nodeDetected()) {  // first node only once
+    continueForwardShort();
     advanceCase(CASE_0, true);              // enter CASE 0 without flipping
     nodeCounter = 0;   // reset count after entering CASE 0
     Serial.println("First node detected, entering CASE 0 | nodeCounter reset to 0");
