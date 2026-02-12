@@ -34,8 +34,8 @@ int AnalogPin[5]   = {4, 5, 6, 7, 15};  // TCRT5000 outputs
 //=======================CALIBRATION VARIABLES==============================
 
 //Light levels 
-const int nodeLightLevel = 3700;
-const int lostLightLevel = 750;
+const int nodeLightLevel = 3500;
+const int lostLightLevel = 700;
 
 //Speed
 int baseSpeedTarget = 180;
@@ -390,10 +390,29 @@ float readUltrasoundCm() {
 }
 
 void driveStraightUntilObstacle() {
-    while (!nodeDetected()) {
+  int count = 0;
+    if (lastCase != CASE_0 && lastCase != CASE_2) {
+      readSensorsAndPrint();
+      while(count != 3) {
+        continueFowardShort();
         lineFollowStep();
-        delay(250);
-    }
+        readSensorsAndPrint();
+        if (nodeDetected()) {
+          count++;
+        }
+        if (count == 1) {
+          Brake(0);
+          flip180();
+        }
+      }
+    } else {
+        readSensorsAndPrint();
+        while (!nodeDetected()) {
+            lineFollowStep();
+            readSensorsAndPrint();
+            delay(50);
+        }
+      }
 
     while (true) {
         float distance = readUltrasoundCm();
@@ -466,7 +485,6 @@ void loop() {
 
   // Detect the first node for starting CASE 0
   if (!startedRoute && nodeDetected()) {  // first node only once
-    continueForwardShort();
     advanceCase(CASE_0, true);              // enter CASE 0 without flipping
     nodeCounter = 0;   // reset count after entering CASE 0
     Serial.println("First node detected, entering CASE 0 | nodeCounter reset to 0");
@@ -1024,7 +1042,7 @@ void advanceCase(CaseState nextCase, bool enteringFromStart) {
           if (lastCase == CASE_3 || lastCase == CASE_4) flip180();
         }
         else if (parking == true) {
-          if (lastCase == CASE_3 || lastCase == CASE_4) flip180();
+          if (lastCase != CASE_0 && lastCase != CASE_2) flip180();
         }
         break;
 
