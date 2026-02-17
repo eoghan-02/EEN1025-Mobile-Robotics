@@ -78,6 +78,8 @@ bool startedRoute = false;
 bool routeReady = false;   // becomes true only after a valid route is fetched and assigned
 bool parking = false;
 int finalPos;
+unsigned long parkingStart;
+unsigned long elapsed;
 //===========================================================
 
 unsigned long lastNodeTime = 0;
@@ -94,6 +96,8 @@ void spinRight(int speed);
 void spinLeft(int speed);
 void turnLeft90();
 void turnRight90();
+void turnRight20();
+void turnLeft20();
 void flip180();
 void continueForwardShort();
 
@@ -375,33 +379,149 @@ void stopAndHalt() {
   while (true) delay(1000);
 }
 
-float readUltrasoundCm() {
+float getDistance() {
     long duration;
+
     digitalWrite(trigPin, LOW);
     delayMicroseconds(2);
     digitalWrite(trigPin, HIGH);
     delayMicroseconds(10);
     digitalWrite(trigPin, LOW);
 
-    duration = pulseIn(echoPin, HIGH, 30000); // 30ms timeout (~5m max)
-    if (duration == 0) return 500; // no echo detected, return large distance
+    duration = pulseIn(echoPin, HIGH, 30000);
+
+    if (duration == 0) return 500;
+
     float distanceCm = (duration * SOUND_SPEED) / 2.0;
     return distanceCm;
 }
 
-void driveStraightUntilObstacle() {
-    readSensorsAndPrint();
-    while (!nodeDetected()) {
-        readSensorsAndPrint();
-        lineFollowStep();
+float readUltrasoundCm() {
+    float sum = 0;
+    int valid = 0;
+
+    for (int i = 0; i < 1; i++) {
+        float d = getDistance();
+        if (d > 0 && d < 400) {
+            sum += d;
+            valid++;
+        }
+        delay(60);
     }
 
+    if (valid == 0) return -1;
+    return sum / valid;
+}
+
+void driveStraightUntilObstacle() {
+  bool straightObstacle = false;
+  bool leftObstacle = false;
+  float distance;
+  readSensorsAndPrint();
+  while (!nodeDetected()) {
+      readSensorsAndPrint();
+      lineFollowStep();
+  }
+
+  parkingStart = millis();
+  while(true) {
+    elapsed = millis() - parkingStart;
+    digitalWrite(motor1Phase, ACW);
+    digitalWrite(motor2Phase, CW);
+    analogWrite(motor1PWM, 99);
+    analogWrite(motor2PWM, 100);
+    delay(50);
+
+    if (elapsed > 4000) {
+      Serial.print("Drove for 4 seconds");
+      Brake(0);
+      parkingStart = millis();
+      elapsed = 0;
+      break;
+    }
+  }
+
+    distance = readUltrasoundCm();
+    if (distance < 55.0) {
+      turnRight90();
+      parkingStart = millis();
+      while (true) {
+        elapsed = millis() - parkingStart;
+        digitalWrite(motor1Phase, ACW);
+        digitalWrite(motor2Phase, CW);
+        analogWrite(motor1PWM, 99);
+        analogWrite(motor2PWM, 100);
+        delay(50);
+        if (elapsed >= 1200) {
+          Brake(0);
+          parkingStart = millis();
+          elapsed = 0;
+          break;
+        }
+      }
+      turnLeft90();
+      straightObstacle = true;
+    }
+     if (straightObstacle == false) {
+      turnLeft20();
+      distance = readUltrasoundCm();
+      if (distance < 60.0) {
+        turnRight20();
+        turnRight90();
+        parkingStart = millis();
+        while (true) {
+          elapsed = millis() - parkingStart;
+          digitalWrite(motor1Phase, ACW);
+          digitalWrite(motor2Phase, CW);
+          analogWrite(motor1PWM, 99);
+          analogWrite(motor2PWM, 100);
+          delay(50);
+          if (elapsed >= 2000) {
+            Brake(0);
+            parkingStart = millis();
+            elapsed = 0;
+            break;
+          }
+        }
+        turnLeft90();
+        leftObstacle = true;
+      } else {
+        turnRight20();
+      }
+    } 
+    if (straightObstacle == false && leftObstacle == false) {
+      turnRight20();
+      distance = readUltrasoundCm();
+      if (distance < 60.0) {
+        turnLeft20();
+        turnLeft90();
+        parkingStart = millis();
+        while (true) {
+          elapsed = millis() - parkingStart;
+          digitalWrite(motor1Phase, ACW);
+          digitalWrite(motor2Phase, CW);
+          analogWrite(motor1PWM, 99);
+          analogWrite(motor2PWM, 100);
+          delay(50);
+          if (elapsed >= 2000) {
+            Brake(0);
+            parkingStart = millis();
+            elapsed = 0;
+            break;
+          }
+        }
+        turnRight90();
+      } else {
+          turnLeft20();
+      }
+      }
+
     while (true) {
-        float distance = readUltrasoundCm();
+        distance = readUltrasoundCm();
         Serial.print("Distance (cm): ");
         Serial.println(distance);
 
-        if (distance <= 6.0) {
+        if (distance <= 8.0) {
             Brake(0);
             break;
         }
@@ -666,6 +786,7 @@ void handleNodeLogic() {
   //---------------------IF ROUTE IS 1 -> 5------------------------
   if (parking && currentCase == CASE_1 && nextCase == CASE_1) {
     Serial.println("Starting parking routine immediately");
+    advanceCase(CASE_1);
     driveStraightUntilObstacle();
     sendArrivalToServer(5);
     finalPos = 5;
@@ -1091,7 +1212,7 @@ void advanceCase(CaseState nextCase, bool enteringFromStart) {
 
 void turnLeft90() {
   actionInProgress = true;
-  spinLeft(120);                // slower turn
+  spinLeft(130);                // slower turn
   delay(500);                  // adjust delay for slower spin
   Brake(50);
   actionInProgress = false;
@@ -1099,7 +1220,7 @@ void turnLeft90() {
 
 void turnRight90() {
   actionInProgress = true;
-  spinRight(120);               // slower turn
+  spinRight(130);               // slower turn
   delay(500);                  // adjust delay for slower spin
   Brake(50);
   actionInProgress = false;
@@ -1110,6 +1231,22 @@ void flip180() {
   actionInProgress = true;
   spinRight(170);
   delay(900);
+  Brake(50);
+  actionInProgress = false;
+}
+
+void turnRight20() {
+  actionInProgress = true;
+  spinRight(100);
+  delay(166);   // ~20 degrees (tune if needed)
+  Brake(50);
+  actionInProgress = false;
+}
+
+void turnLeft20() {
+  actionInProgress = true;
+  spinLeft(100);
+  delay(166);   // ~20 degrees (tune if needed)
   Brake(50);
   actionInProgress = false;
 }
