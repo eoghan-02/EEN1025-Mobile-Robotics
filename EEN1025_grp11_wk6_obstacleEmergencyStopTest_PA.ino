@@ -408,18 +408,37 @@ void stopAndHalt() {
   while (true) delay(1000);
 }
 
-float readUltrasoundCm() {
+float getDistance() {
     long duration;
+
     digitalWrite(trigPin, LOW);
     delayMicroseconds(2);
     digitalWrite(trigPin, HIGH);
     delayMicroseconds(10);
     digitalWrite(trigPin, LOW);
 
-    duration = pulseIn(echoPin, HIGH, 30000); // 30ms timeout (~5m max)
-    if (duration == 0) return 500; // no echo detected, return large distance
+    duration = pulseIn(echoPin, HIGH, 30000);
+
+    if (duration == 0) return 500;
+
     float distanceCm = (duration * SOUND_SPEED) / 2.0;
     return distanceCm;
+}
+
+float readUltrasoundCm() {
+    float sum = 0;
+    int valid = 0;
+
+    for (int i = 0; i < 5; i++) {
+        float d = getDistance();
+        if (d > 0 && d < 400) {
+            sum += d;
+            valid++;
+        }
+        delay(60);
+    }
+    if (valid == 0) return -1;
+    return sum / valid;
 }
 
 void driveStraightUntilObstacle() {
