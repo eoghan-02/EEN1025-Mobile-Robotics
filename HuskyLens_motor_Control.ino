@@ -5,8 +5,8 @@
 #define ACW HIGH
 
 //Pin Definitions 
-int Red1 = 13;
-int Blue1 = 12;
+int Red1 = 19;
+int Blue1 = 42;
 int BUZZER_PIN = 2;
 
 int motor1PWM   = 37; // LHS motor
