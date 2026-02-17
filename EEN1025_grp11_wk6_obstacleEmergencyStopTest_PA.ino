@@ -429,7 +429,7 @@ float readUltrasoundCm() {
     float sum = 0;
     int valid = 0;
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 1; i++) {
         float d = getDistance();
         if (d > 0 && d < 400) {
             sum += d;
