@@ -1,19 +1,6 @@
 #include <WiFi.h>
 #include <queue>
 
-enum GraphNode {
-  GN_NODE_0,
-  GN_NODE_1,
-  GN_NODE_2,
-  GN_NODE_3,
-  GN_NODE_4,
-  GN_JUNC_A,   // between 0/1 and 2
-  GN_JUNC_B,   // between 3/4 and 1
-  GN_COUNT
-};
-
-enum CaseState {CASE_0, CASE_1, CASE_2, CASE_3, CASE_4, CASE_5};
-
 // ======================= WIFI + SERVER CONFIG =======================
 static char ssid[]     = "iPhone";
 static char password[] = "haider1432";
@@ -29,7 +16,13 @@ static const char ROBOT_ID[] = "pllk3098";
 
 #define CW  LOW
 #define ACW HIGH
+enum USState {US_IDLE, US_TRIGGER, US_WAIT_ECHO_HIGH, US_WAIT_ECHO_LOW};
+USState usState = US_IDLE;
 
+unsigned long usTimer = 0;
+unsigned long echoStart = 0;
+float latestDistance = 999;
+bool newReading = false;
 // Motor pins
 int motor1PWM   = 37; // LHS motor
 int motor1Phase = 38;
@@ -76,50 +69,25 @@ const int echoPin = 17;
 // Sound speed in cm/us
 #define SOUND_SPEED 0.034
 
-// ================= ULTRASONIC TASK (2nd CORE) =================
-// Arduino-ESP32 runs `loop()` on core 1 by default. We pin the ultrasonic task to core 0.
-static TaskHandle_t ultrasonicTaskHandle = nullptr;
-static portMUX_TYPE ultraMux = portMUX_INITIALIZER_UNLOCKED;
-static volatile float g_ultra_cm = -1.0f;   // latest valid reading (cm), -1 if invalid
-
-static float getUltrasoundCachedCm() {
-  portENTER_CRITICAL(&ultraMux);
-  float d = g_ultra_cm;
-  portEXIT_CRITICAL(&ultraMux);
-  return d;
-}
-
-static void setUltrasoundCachedCm(float d) {
-  portENTER_CRITICAL(&ultraMux);
-  g_ultra_cm = d;
-  portEXIT_CRITICAL(&ultraMux);
-}
-
-void ultrasonicTask(void *pvParameters) {
-  (void)pvParameters;
-  for (;;) {
-    float d = getDistance();
-
-    // Normalize invalid/out-of-range readings
-    if (!(d > 0.0f && d < 400.0f)) {
-      d = -1.0f;
-    }
-
-    setUltrasoundCachedCm(d);
-
-    // Keep the same 60ms cadence as your current code
-    vTaskDelay(pdMS_TO_TICKS(60));
-  }
-}
-
 //=================DETOUR HANDLING=====================
+
+enum GraphNode {
+  GN_NODE_0,
+  GN_NODE_1,
+  GN_NODE_2,
+  GN_NODE_3,
+  GN_NODE_4,
+  GN_JUNC_A,   // between 0/1 and 2
+  GN_JUNC_B,   // between 3/4 and 1
+  GN_COUNT
+};
 
 const int MAX_GRAPH_NODES = GN_COUNT;
 
 // CASE connections (0-indexed, 5 nodes)
 int adjacencyMatrix[MAX_GRAPH_NODES][MAX_GRAPH_NODES] = {
     // 0  1  2  3  4 A B
-    {0, 0, 0, 0, 1, 1, 0},
+    {0, 0, 0, 0, 0, 1, 0},
     {0, 0, 0, 0, 0, 1, 1},
     {0, 0, 0, 1, 0, 1, 0},
     {0, 0, 1, 0, 0, 0, 1},
@@ -140,6 +108,7 @@ bool obstacleMatrix[MAX_GRAPH_NODES][MAX_GRAPH_NODES] = {
 };
 
 //================ STATE MACHINE FOR ROUTE =================
+enum CaseState {CASE_0, CASE_1, CASE_2, CASE_3, CASE_4, CASE_5};
 CaseState currentCase = CASE_0;
 CaseState lastCase    = CASE_0;
 
@@ -157,9 +126,10 @@ int finalPos;
 unsigned long parkingStart;
 unsigned long elapsed;
 unsigned long lastObstacleCheck = 0;
-const unsigned long OBSTACLE_CHECK_INTERVAL = 80;
+const unsigned long OBSTACLE_CHECK_INTERVAL = 0;
 bool ignoreNextNode = false;
-int distance_readings = 3;
+int obstacleConfidence = 0;
+
 
 // Maximum number of nodes
 const int MAX_NODES = 5;
@@ -205,6 +175,60 @@ int findSharedJunction(int a, int b) {
   }
   return -1;
 }
+void ultrasonicTask() {
+
+    switch (usState) {
+
+        case US_IDLE:
+            if (micros() - usTimer > 60000) { // every 60ms
+                digitalWrite(trigPin, LOW);
+                usTimer = micros();
+                usState = US_TRIGGER;
+            }
+        break;
+
+        case US_TRIGGER:
+            if (micros() - usTimer >= 5) {
+                digitalWrite(trigPin, HIGH);
+                delayMicroseconds(10);
+                digitalWrite(trigPin, LOW);
+                usState = US_WAIT_ECHO_HIGH;
+                usTimer = micros();
+            }
+        break;
+
+        case US_WAIT_ECHO_HIGH:
+            if (digitalRead(echoPin) == HIGH) {
+                echoStart = micros();
+                usState = US_WAIT_ECHO_LOW;
+            }
+            else if (micros() - usTimer > 20000) {
+                usState = US_IDLE;
+            }
+        break;
+
+        case US_WAIT_ECHO_LOW:
+            if (digitalRead(echoPin) == LOW) {
+
+                unsigned long duration = micros() - echoStart;
+                float d = duration * 0.0343 / 2.0;
+
+                if (d > 12 && d < 200)
+                    latestDistance = d;
+                else
+                    latestDistance = 999;
+
+                newReading = true;
+                usState = US_IDLE;
+                usTimer = micros();
+            }
+            else if (micros() - echoStart > 20000) {
+                usState = US_IDLE;
+            }
+        break;
+    }
+}
+
 
 //===========================================================
 
@@ -590,32 +614,51 @@ void stopAndHalt() {
 }
 
 float getDistance() {
-    long duration;
 
+    // settle sensor
     digitalWrite(trigPin, LOW);
-    delayMicroseconds(2);
+    delayMicroseconds(5);
+
+    // trigger pulse
     digitalWrite(trigPin, HIGH);
     delayMicroseconds(10);
     digitalWrite(trigPin, LOW);
 
-    duration = pulseIn(echoPin, HIGH, 30000);
+    long duration = pulseIn(echoPin, HIGH, 18000); // 18ms = 3m max
 
-    if (duration == 0) return 500;
+    if (duration == 0)
+        return 999; // no echo
 
-    float distanceCm = (duration * SOUND_SPEED) / 2.0;
-    return distanceCm;
+    float distance = (duration * 0.0343) / 2.0;
+
+    // ===== CRITICAL FILTER =====
+    // reject floor reflections & noise
+    if (distance < 12.0) return 999;
+
+    return distance;
 }
 
 float readUltrasoundCm() {
-  // Non-blocking: return the most recent value produced by ultrasonicTask()
-  return getUltrasoundCachedCm();
+    float sum = 0;
+    int valid = 0;
+
+    for (int i = 0; i < 5; i++) {
+        float d = getDistance();
+        if (d > 12 && d < 300) {
+            sum += d;
+            valid++;
+        }
+        delay(15);
+    }
+
+    if (valid == 0) return 999;
+    return sum / valid;
 }
 
 void driveStraightUntilObstacle() {
   bool straightObstacle = false;
   bool leftObstacle = false;
   float distance;
-  distance_readings = 1;
   readSensorsAndPrint();
   while (!nodeDetected()) {
       readSensorsAndPrint();
@@ -750,18 +793,6 @@ void setup() {
   pinMode(trigPin, OUTPUT);
   pinMode(echoPin, INPUT);
 
-// Start continuous ultrasonic sampling on the second core (core 0)
-// NOTE: `loop()` runs on core 1 by default in Arduino-ESP32.
-xTaskCreatePinnedToCore(
-    ultrasonicTask,          // task function
-    "UltrasonicTask",        // name
-    4096,                    // stack (bytes)
-    nullptr,                 // params
-    1,                       // priority
-    &ultrasonicTaskHandle,   // handle
-    0                        // core 0
-);
-	
 
   delay(1000);
   connectToWiFi();
@@ -787,6 +818,7 @@ xTaskCreatePinnedToCore(
 }
 
 void loop() {
+  ultrasonicTask();
   // Do not start driving until route is received and assigned
   if (!routeReady) {
     Brake(0);
@@ -825,13 +857,15 @@ void loop() {
   }
   if (!detourActive && startedRoute && routeIndex < routeLength) {
 
-      if (millis() - lastObstacleCheck > OBSTACLE_CHECK_INTERVAL) {
+if (newReading) {
+    newReading = false;
 
-          lastObstacleCheck = millis();
-
-          float dist = readUltrasoundCm();
-
-          if (dist > 0.0 && dist <= 8.5) {
+    if (latestDistance < 20) {
+        obstacleConfidence++;
+    } else {
+        obstacleConfidence = 0;
+    }
+          if (obstacleConfidence >= 3) {
               int startG = (int)caseToGraph(currentCase);
               int targetG = (int)caseToGraph(route[routeIndex]);
               int sharedJ = findSharedJunction(startG, targetG);
@@ -877,7 +911,6 @@ void loop() {
 
               Serial.print("Detour ready. Index start at "); Serial.println(detourIndex);
           }
-      }
   }
 }
 
@@ -1535,7 +1568,7 @@ void advanceCase(CaseState nextCase, bool enteringFromStart) {
 void turnLeft90() {
   actionInProgress = true;
   spinLeft(120);                // slower turn
-  delay(700);                  // adjust delay for slower spin
+  delay(500);                  // adjust delay for slower spin
   Brake(50);
   actionInProgress = false;
 }
@@ -1543,7 +1576,7 @@ void turnLeft90() {
 void turnRight90() {
   actionInProgress = true;
   spinRight(120);               // slower turn
-  delay(700);                  // adjust delay for slower spin
+  delay(500);                  // adjust delay for slower spin
   Brake(50);
   actionInProgress = false;
 }
