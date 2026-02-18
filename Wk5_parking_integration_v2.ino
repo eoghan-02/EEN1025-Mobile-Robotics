@@ -1,4 +1,5 @@
 #include <WiFi.h>
+#include <queue>
 
 // ======================= WIFI + SERVER CONFIG =======================
 static char ssid[]     = "iPhone";
@@ -62,6 +63,44 @@ const int echoPin = 17;
 // Sound speed in cm/us
 #define SOUND_SPEED 0.034
 
+//=================DETOUR HANDLING=====================
+
+enum GraphNode {
+  GN_NODE_0,
+  GN_NODE_1,
+  GN_NODE_2,
+  GN_NODE_3,
+  GN_NODE_4,
+  GN_JUNC_A,   // between 0/1 and 2
+  GN_JUNC_B,   // between 3/4 and 1
+  GN_COUNT
+};
+
+const int MAX_GRAPH_NODES = GN_COUNT;
+
+// CASE connections (0-indexed, 5 nodes)
+int adjacencyMatrix[MAX_GRAPH_NODES][MAX_GRAPH_NODES] = {
+    // 0  1  2  3  4 A B
+    {0, 0, 0, 0, 0, 1, 0},
+    {0, 0, 0, 0, 0, 1, 1},
+    {0, 0, 0, 1, 0, 1, 0},
+    {0, 0, 1, 0, 0, 0, 1},
+    {1, 0, 0, 0, 0, 0, 1},
+    {1, 1, 1, 0, 0, 0, 0},
+    {0, 1, 0, 1, 1, 0, 0}
+};
+
+// false = edge free, true = edge blocked
+bool obstacleMatrix[MAX_GRAPH_NODES][MAX_GRAPH_NODES] = {
+  {false, false, false, false, false, false, false},
+  {false, false, false, false, false, false, false},
+  {false, false, false, false, false, false, false},
+  {false, false, false, false, false, false, false},
+  {false, false, false, false, false, false, false},
+  {false, false, false, false, false, false, false},
+  {false, false, false, false, false, false, false}
+};
+
 //================ STATE MACHINE FOR ROUTE =================
 enum CaseState {CASE_0, CASE_1, CASE_2, CASE_3, CASE_4, CASE_5};
 CaseState currentCase = CASE_0;
@@ -80,6 +119,55 @@ bool parking = false;
 int finalPos;
 unsigned long parkingStart;
 unsigned long elapsed;
+unsigned long lastObstacleCheck = 0;
+const unsigned long OBSTACLE_CHECK_INTERVAL = 140;
+bool ignoreNextNode = false;
+
+// Maximum number of nodes
+const int MAX_NODES = 5;
+
+// Detour system
+bool detourActive = false;
+CaseState detourPath[MAX_NODES];
+int detourLength = 0;
+int detourIndex = 0;
+
+// Map CaseState <-> GraphNode and helpers
+GraphNode caseToGraph(CaseState c) {
+  switch (c) {
+    case CASE_0: return GN_NODE_0;
+    case CASE_1: return GN_NODE_1;
+    case CASE_2: return GN_NODE_2;
+    case CASE_3: return GN_NODE_3;
+    case CASE_4: return GN_NODE_4;
+    default: return GN_NODE_0;
+  }
+}
+
+CaseState graphToCase(int g) {
+  switch (g) {
+    case GN_NODE_0: return CASE_0;
+    case GN_NODE_1: return CASE_1;
+    case GN_NODE_2: return CASE_2;
+    case GN_NODE_3: return CASE_3;
+    case GN_NODE_4: return CASE_4;
+    default: return CASE_0; // for junctions - should never be used directly
+  }
+}
+
+bool isJunctionNode(int g) {
+  return (g == GN_JUNC_A || g == GN_JUNC_B);
+}
+
+// Find a junction graph node that connects both a and b (returns -1 if none)
+int findSharedJunction(int a, int b) {
+  for (int j = 0; j < MAX_GRAPH_NODES; j++) {
+    if (!isJunctionNode(j)) continue;
+    if (adjacencyMatrix[j][a] && adjacencyMatrix[j][b]) return j;
+  }
+  return -1;
+}
+
 //===========================================================
 
 unsigned long lastNodeTime = 0;
@@ -373,6 +461,90 @@ bool fetchRouteFromServer() {
   return true;
 }
 
+// BFS on graph nodes (MAX_GRAPH_NODES). Accepts graph indices for start/target.
+// Produces detourPath[] of CaseState values (skips junctions).
+void computeDetourPath(GraphNode startG, GraphNode targetG) {
+    int parent[MAX_GRAPH_NODES];
+    bool visited[MAX_GRAPH_NODES] = {false};
+    std::queue<int> q;
+
+    for (int i = 0; i < MAX_GRAPH_NODES; i++) parent[i] = -1;
+
+    q.push((int)startG);
+    visited[(int)startG] = true;
+
+    bool pathFound = false;
+    while (!q.empty()) {
+        int u = q.front(); q.pop();
+        if (u == (int)targetG) { pathFound = true; break; }
+
+        for (int v = 0; v < MAX_GRAPH_NODES; v++) {
+            // Only traverse if edge exists and not blocked
+            if (adjacencyMatrix[u][v] && !obstacleMatrix[u][v] && !visited[v]) {
+                visited[v] = true;
+                parent[v] = u;
+                q.push(v);
+            }
+        }
+    }
+
+    if (!pathFound) {
+        Serial.println("No detour path found (graph-level). Robot will stop or retry.");
+        detourActive = false;
+        detourLength = 0;
+        return;
+    }
+
+    // Reconstruct graph path (target -> start)
+    int graphPath[MAX_GRAPH_NODES];
+    int cnt = 0;
+    int node = (int)targetG;
+    while (node != -1) {
+        graphPath[cnt++] = node;
+        node = parent[node];
+    }
+
+    // Reverse and compress into CaseState detourPath (skip junctions)
+    detourLength = 0;
+    for (int i = cnt - 1; i >= 0; i--) {
+        int g = graphPath[i];
+        if (isJunctionNode(g)) continue;           // skip junctions
+        CaseState cs = graphToCase(g);
+        // avoid including currentCase as first element
+        if (detourLength == 0 && cs == currentCase) continue;
+        // avoid duplicates (graph can produce repeated CaseStates)
+        if (detourLength > 0 && detourPath[detourLength - 1] == cs) continue;
+        detourPath[detourLength++] = cs;
+    }
+
+    // Finalize detour state
+    if (detourLength == 0) {
+        detourActive = false;
+        detourIndex = 0;
+    } else {
+        detourActive = true;
+        detourIndex = 0; // start with the first case in detourPath
+    }
+
+    // Debug print
+    Serial.print("Detour (case sequence): ");
+    for (int i = 0; i < detourLength; i++) {
+        Serial.print(detourPath[i]);
+        if (i < detourLength - 1) Serial.print(" -> ");
+    }
+    Serial.println();
+}
+
+void driveUntilJunction() {
+  // drive forward using line follow until a junction/node is detected
+  while (!nodeDetected()) {
+    readSensorsAndPrint();
+    lineFollowStep();
+    delay(5);
+  }
+  Brake(50);
+}
+
 void stopAndHalt() {
   Serial.println("Route complete. Stopping motors and halting.");
   Brake(0);
@@ -595,6 +767,13 @@ void loop() {
 
   // Normal node handling after first CASE
   if (startedRoute && nodeDetected()) {
+    
+    if (ignoreNextNode) {
+    ignoreNextNode = false;
+    nodeCounter = 0;
+    return;   // skip logic once
+    }
+
     nodeCounter++;
     Serial.print("Node hit: ");
     Serial.println(nodeCounter);
@@ -604,6 +783,62 @@ void loop() {
   // Start driving (line following) after route is ready. This will carry the car to the first node.
   if (!actionInProgress) {
     lineFollowStep();
+  }
+  if (!detourActive && startedRoute && routeIndex < routeLength) {
+
+      if (millis() - lastObstacleCheck > OBSTACLE_CHECK_INTERVAL) {
+
+          lastObstacleCheck = millis();
+
+          float dist = readUltrasoundCm();
+
+          if (dist > 0.0 && dist <= 8.5) {
+              int startG = (int)caseToGraph(currentCase);
+              int targetG = (int)caseToGraph(route[routeIndex]);
+              int sharedJ = findSharedJunction(startG, targetG);
+
+              if (sharedJ != -1) {
+                  obstacleMatrix[sharedJ][targetG] = true;
+                  obstacleMatrix[targetG][sharedJ] = true;
+                  Serial.print("Blocked physical edge:");
+                  Serial.print(" startG="); Serial.print(startG);
+                  Serial.print(" targetG="); Serial.print(targetG);
+                  Serial.print(" sharedJ="); Serial.println(sharedJ);
+              } else {
+                  obstacleMatrix[startG][targetG] = true;
+                  obstacleMatrix[targetG][startG] = true;
+                  Serial.print("Blocked fallback edge: ");
+                  Serial.print(startG);
+                  Serial.print(" <-> ");
+                  Serial.println(targetG);
+              }
+
+              Brake(50);
+              flip180();
+              driveUntilJunction();
+              Serial.print("Arrived back at physical junction (sharedJ): "); Serial.println(sharedJ);
+              Brake(50);
+
+              // reset nodeCounter AFTER physically arriving at junction
+              nodeCounter = 0;
+
+              // compute detour starting from current physical junction
+              GraphNode detourStart = (sharedJ != -1) ? (GraphNode)sharedJ : (GraphNode)startG;
+              computeDetourPath(detourStart, (GraphNode)targetG);
+
+              // Skip the first detour step if robot is already there
+              if (detourActive && detourLength > 0 && graphToCase(detourStart) == detourPath[0]) {
+                  detourIndex = 1;
+              } else {
+                  detourIndex = 0;
+              }
+
+              ignoreNextNode = false;  // reset flag; first detour node should be processed
+              lastNodeTime = millis();
+
+              Serial.print("Detour ready. Index start at "); Serial.println(detourIndex);
+          }
+      }
   }
 }
 
@@ -779,9 +1014,26 @@ bool nodeDetected() {
 //==================== ROUTE CONTROL LOGIC ====================
 
 void handleNodeLogic() {
+
   if (routeIndex >= routeLength) return;
 
-  CaseState nextCase = route[routeIndex];
+  CaseState nextCase;
+
+  if (detourActive && detourIndex < detourLength) {
+      nextCase = detourPath[detourIndex];
+  } else {
+      nextCase = route[routeIndex];
+  }
+
+  Serial.print("DBG handleNodeLogic: currentCase=");
+  Serial.print(currentCase);
+  Serial.print(" detourActive=");
+  Serial.print(detourActive);
+  Serial.print(" detourIndex=");
+  Serial.print(detourIndex);
+  Serial.print(" nextCase=");
+  Serial.println(nextCase);
+
 
   //---------------------IF ROUTE IS 1 -> 5------------------------
   if (parking && currentCase == CASE_1 && nextCase == CASE_1) {
@@ -1091,25 +1343,38 @@ break;
 
 // Step 3: Small forward move after CASE transition (physically leave the junction)
 if (didAdvanceCase) {
-  routeIndex++;           // advance to the next target in the route
 
-  // Physically leave the junction after switching cases
-  continueForwardShort();
-  // If we have just completed the last CASE in the route, stop and report finish.
-  if (routeIndex >= routeLength) {
-    if (parking == true) {
-      driveStraightUntilObstacle();
-      sendArrivalToServer(5);
-      finalPos = 5;
-    }
-    else {
-      finalPos = (int)currentCase;
-    }
-    // Arrival already reported in advanceCase(); this is explicit completion.
-    sendFinishedToServer(finalPos);
+    if (detourActive) {
+        // Move to next detour step (we just entered the current detour element)
+        detourIndex++;
 
-    stopAndHalt();
-  }
+        // End detour if we've consumed all detour steps OR if we've reached the original route target
+        if (detourIndex >= detourLength || currentCase == route[routeIndex]) {
+            detourActive = false;
+            detourIndex = 0;
+            detourLength = 0;
+            // Completed the detour: advance the main route pointer
+            routeIndex++;
+        }
+    } else {
+        // Normal (non-detour) progress along original route
+        routeIndex++;
+    }
+
+    continueForwardShort();
+
+    if (routeIndex >= routeLength) {
+        if (parking == true) {
+            driveStraightUntilObstacle();
+            sendArrivalToServer(5);
+            finalPos = 5;
+        } else {
+            finalPos = (int)currentCase;
+        }
+
+        sendFinishedToServer(finalPos);
+        stopAndHalt();
+    }
 }
 
 }
@@ -1124,7 +1389,17 @@ void advanceCase(CaseState nextCase, bool enteringFromStart) {
   currentCase = nextCase;
 
   // Determine next CASE in the route (upcoming)
-  CaseState upcomingCase = (routeIndex + 1 < routeLength) ? route[routeIndex + 1] : currentCase;
+  CaseState upcomingCase;
+
+  if (detourActive) {
+      if (detourIndex + 1 < detourLength)
+          upcomingCase = detourPath[detourIndex + 1];
+      else
+          upcomingCase = currentCase;
+  } else {
+      upcomingCase = (routeIndex + 1 < routeLength) ? route[routeIndex + 1] : currentCase;
+  }
+
 
   // ===== REORIENTATION PHASE (happens BEFORE node counting) =====
   // Skip flips if entering from start
@@ -1205,14 +1480,22 @@ void advanceCase(CaseState nextCase, bool enteringFromStart) {
   Serial.print("Switching to CASE ");
   Serial.println(currentCase);
   // Notify the server when we arrive at the start of each CASE_X (including CASE_0 at start)
-  sendArrivalToServer((int)currentCase);
+  if (!detourActive) {
+      sendArrivalToServer((int)currentCase);
+  }
+  else {
+      if (currentCase == route[routeIndex]) {
+          sendArrivalToServer((int)currentCase);
+      }
+  }
+
 }
 
 //==================== MOVEMENT ACTIONS ====================
 
 void turnLeft90() {
   actionInProgress = true;
-  spinLeft(130);                // slower turn
+  spinLeft(120);                // slower turn
   delay(500);                  // adjust delay for slower spin
   Brake(50);
   actionInProgress = false;
@@ -1220,7 +1503,7 @@ void turnLeft90() {
 
 void turnRight90() {
   actionInProgress = true;
-  spinRight(130);               // slower turn
+  spinRight(120);               // slower turn
   delay(500);                  // adjust delay for slower spin
   Brake(50);
   actionInProgress = false;
