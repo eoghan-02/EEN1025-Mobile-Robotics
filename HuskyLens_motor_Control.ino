@@ -38,7 +38,7 @@ const int DEAD_BAND = 18;      // pixels
 float Kp = 0.50f;                
 
 // Base speed 
-int baseSpeed = 100;
+int baseSpeed = 120;
 
 // Hard limit on steering strength
 int maxSteer = 35;
@@ -86,7 +86,27 @@ const uint32_t STEP_MS  = 2;
 // ===== YELP settings =====
 const uint32_t YELP_INTERVAL_MS = 4000;  // how often yelp occurs
 const uint32_t YELP_DURATION_MS = 800;   // how long yelp lasts
-const uint32_t YELP_PULSE_MS    = 30;    // yelp aggressiveness 
+const uint32_t YELP_PULSE_MS    = 30;    // yelp aggressiveness
+
+// ===== SPEED TRIGGER (from ultrasound) =====
+float prevDistCm = -1;
+uint32_t prevDistMs = 0;
+float speedCms = 0;                 // filtered speed (cm/s)
+
+// Tune these:
+const float SPEED_TRIGGER_CMS = 40.0f;   // trigger chase if speed > this (cm/s)
+const float SPEED_ALPHA = 0.15f;          // smoothing 0
+const uint32_t SPEED_SAMPLE_MS = 150;    // how often to update speed
+const float DIST_DEADBAND_CM = 2.0f;   // ignore <2cm changes (tune 1.5–4)
+uint32_t speedHighSinceMs = 0;
+const uint32_t SPEED_HOLD_MS = 700;   // must be high for 0.4s to trigger
+
+
+// ===== ULTRASOUND =====
+const int trigPin = 16;
+const int echoPin = 17;
+
+#define SOUND_SPEED 0.0343f   // cm per microsecond
 
 
 bool ensureHuskyReady() {
@@ -237,6 +257,83 @@ bool getFirstBlockX(int &x) {
   return false;
 }
 
+float getDistance() {
+  unsigned long duration;
+
+  // Trigger pulse
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  // Measure echo pulse (timeout avoids blocking)
+  duration = pulseIn(echoPin, HIGH, 30000UL); // 30ms timeout (~5m)
+
+  if (duration == 0) return -1;  // invalid / out of range
+
+  float distanceCm = (duration * SOUND_SPEED) / 2.0f;
+
+  // Clamp to sensor practical range
+  if (distanceCm <= 0 || distanceCm > 400) return -1;
+  return distanceCm;
+}
+
+float readUltrasoundCm() {
+  float a = getDistance(); delay(20);
+  float b = getDistance(); delay(20);
+  float c = getDistance();
+
+  if (a < 0 || b < 0 || c < 0) return -1;
+
+  // median
+  if (a > b) { float t=a; a=b; b=t; }
+  if (b > c) { float t=b; b=c; c=t; }
+  if (a > b) { float t=a; a=b; b=t; }
+
+  return b;
+}
+
+
+void updateSpeedFromUltrasound() {
+  static uint32_t lastSample = 0;
+  uint32_t now = millis();
+  if (now - lastSample < SPEED_SAMPLE_MS) return;
+  lastSample = now;
+
+  float d = readUltrasoundCm();
+  if (d < 0) return;
+
+  if (prevDistCm > 0 && prevDistMs > 0) {
+    float dt = (now - prevDistMs) / 1000.0f;
+    if (dt > 0.02f) {
+      float dd = d - prevDistCm;
+      if (fabsf(dd) < DIST_DEADBAND_CM) dd = 0;
+
+      float v = fabsf(dd / dt); // cm/s
+      speedCms = (1.0f - SPEED_ALPHA) * speedCms + SPEED_ALPHA * v;
+    }
+  }
+
+  prevDistCm = d;
+  prevDistMs = now;
+}
+
+void debugSpeed() {
+  static uint32_t lastPrint = 0;
+  uint32_t now = millis();
+
+  if (now - lastPrint >= 300) {   // print every 300ms
+    lastPrint = now;
+
+    Serial.print("Speed=");
+    Serial.print(speedCms);
+    Serial.print(" cm/s  Dist=");
+    Serial.println(prevDistCm);
+  }
+}
+
+
 
 void setup() {
   Serial.begin(115200);
@@ -247,6 +344,9 @@ void setup() {
   pinMode(motor2Phase, OUTPUT);
   pinMode(Red1, OUTPUT);
   pinMode(Blue1, OUTPUT);
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  digitalWrite(trigPin, LOW);
 
   Wire.begin(I2C_SDA, I2C_SCL);
   delay(600);                 // important for battery boot
@@ -264,25 +364,54 @@ void loop() {
   return;
   }
 
+  updateSpeedFromUltrasound();
+  debugSpeed();
+
+
   int xRaw;
   bool hasTarget = getFirstBlockX(xRaw);
 
-  sirenUpdate(hasTarget);   // siren when target found
-  flashing(hasTarget); 
-
   uint32_t now = millis();
 
-  if (!hasTarget) {
-    // Start lost timer once
-    if (!everHadTarget) {
-    stopMotors();
-    sirenUpdate(false);
-    flashing(false);
-    Serial.println("No target yet (idle)");
+// ===== OBJECT NEVER SEEN MODE =====
+// Stay idle until speed is high enough AND Husky sees the target
+if (!everHadTarget) {
+  stopMotors();
+  sirenUpdate(false);
+  flashing(false);
+
+  // ===== SPEED DEBOUNCE =====
+  if (speedCms > SPEED_TRIGGER_CMS) {
+    if (speedHighSinceMs == 0)
+      speedHighSinceMs = millis();   // start timer
+  } else {
+    speedHighSinceMs = 0;            // reset timer
+  }
+
+  bool speedReallyHigh =
+      (speedHighSinceMs != 0) &&
+      (millis() - speedHighSinceMs >= SPEED_HOLD_MS);
+
+  // ===== TRIGGER CONDITION =====
+  if (hasTarget && speedReallyHigh) {
+    everHadTarget = true;
+    lostMode = false;
+    steerPrev = 0;
+    xFilt = xRaw;
+  } else {
     delay(30);
     return;
   }
+}
 
+
+bool active = hasTarget || lostMode;  // tracking or searching
+sirenUpdate(active);
+flashing(active);
+
+
+  if (!hasTarget) {
+    
     if (!lostMode) {
       lostMode = true;
       lostSinceMs = now;
