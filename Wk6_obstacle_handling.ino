@@ -1,6 +1,19 @@
 #include <WiFi.h>
 #include <queue>
 
+enum GraphNode {
+  GN_NODE_0,
+  GN_NODE_1,
+  GN_NODE_2,
+  GN_NODE_3,
+  GN_NODE_4,
+  GN_JUNC_A,   // between 0/1 and 2
+  GN_JUNC_B,   // between 3/4 and 1
+  GN_COUNT
+};
+
+enum CaseState {CASE_0, CASE_1, CASE_2, CASE_3, CASE_4, CASE_5};
+
 // ======================= WIFI + SERVER CONFIG =======================
 static char ssid[]     = "iPhone";
 static char password[] = "haider1432";
@@ -63,18 +76,43 @@ const int echoPin = 17;
 // Sound speed in cm/us
 #define SOUND_SPEED 0.034
 
-//=================DETOUR HANDLING=====================
+// ================= ULTRASONIC TASK (2nd CORE) =================
+// Arduino-ESP32 runs `loop()` on core 1 by default. We pin the ultrasonic task to core 0.
+static TaskHandle_t ultrasonicTaskHandle = nullptr;
+static portMUX_TYPE ultraMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile float g_ultra_cm = -1.0f;   // latest valid reading (cm), -1 if invalid
 
-enum GraphNode {
-  GN_NODE_0,
-  GN_NODE_1,
-  GN_NODE_2,
-  GN_NODE_3,
-  GN_NODE_4,
-  GN_JUNC_A,   // between 0/1 and 2
-  GN_JUNC_B,   // between 3/4 and 1
-  GN_COUNT
-};
+static float getUltrasoundCachedCm() {
+  portENTER_CRITICAL(&ultraMux);
+  float d = g_ultra_cm;
+  portEXIT_CRITICAL(&ultraMux);
+  return d;
+}
+
+static void setUltrasoundCachedCm(float d) {
+  portENTER_CRITICAL(&ultraMux);
+  g_ultra_cm = d;
+  portEXIT_CRITICAL(&ultraMux);
+}
+
+void ultrasonicTask(void *pvParameters) {
+  (void)pvParameters;
+  for (;;) {
+    float d = getDistance();
+
+    // Normalize invalid/out-of-range readings
+    if (!(d > 0.0f && d < 400.0f)) {
+      d = -1.0f;
+    }
+
+    setUltrasoundCachedCm(d);
+
+    // Keep the same 60ms cadence as your current code
+    vTaskDelay(pdMS_TO_TICKS(60));
+  }
+}
+
+//=================DETOUR HANDLING=====================
 
 const int MAX_GRAPH_NODES = GN_COUNT;
 
@@ -102,7 +140,6 @@ bool obstacleMatrix[MAX_GRAPH_NODES][MAX_GRAPH_NODES] = {
 };
 
 //================ STATE MACHINE FOR ROUTE =================
-enum CaseState {CASE_0, CASE_1, CASE_2, CASE_3, CASE_4, CASE_5};
 CaseState currentCase = CASE_0;
 CaseState lastCase    = CASE_0;
 
@@ -120,7 +157,7 @@ int finalPos;
 unsigned long parkingStart;
 unsigned long elapsed;
 unsigned long lastObstacleCheck = 0;
-const unsigned long OBSTACLE_CHECK_INTERVAL = 140;
+const unsigned long OBSTACLE_CHECK_INTERVAL = 80;
 bool ignoreNextNode = false;
 int distance_readings = 3;
 
@@ -570,20 +607,8 @@ float getDistance() {
 }
 
 float readUltrasoundCm() {
-    float sum = 0;
-    int valid = 0;
-
-    for (int i = 0; i < 1; i++) {
-        float d = getDistance();
-        if (d > 0 && d < 400) {
-            sum += d;
-            valid++;
-        }
-        delay(60);
-    }
-
-    if (valid == 0) return -1;
-    return sum / valid;
+  // Non-blocking: return the most recent value produced by ultrasonicTask()
+  return getUltrasoundCachedCm();
 }
 
 void driveStraightUntilObstacle() {
@@ -725,6 +750,18 @@ void setup() {
   pinMode(trigPin, OUTPUT);
   pinMode(echoPin, INPUT);
 
+// Start continuous ultrasonic sampling on the second core (core 0)
+// NOTE: `loop()` runs on core 1 by default in Arduino-ESP32.
+xTaskCreatePinnedToCore(
+    ultrasonicTask,          // task function
+    "UltrasonicTask",        // name
+    4096,                    // stack (bytes)
+    nullptr,                 // params
+    1,                       // priority
+    &ultrasonicTaskHandle,   // handle
+    0                        // core 0
+);
+	
 
   delay(1000);
   connectToWiFi();
