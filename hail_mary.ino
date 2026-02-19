@@ -37,6 +37,7 @@ unsigned long usTimer = 0;
 unsigned long echoStart = 0;
 float latestDistance = 999;
 bool newReading = false;
+unsigned long latestDistanceMs = 0; // millis() when latestDistance was updated
 // Motor pins
 int motor1PWM   = 37; // LHS motor
 int motor1Phase = 38;
@@ -227,11 +228,13 @@ void ultrasonicTask() {
                 unsigned long duration = micros() - echoStart;
                 float d = duration * 0.0343 / 2.0;
 
-                if (d > 12 && d < 200)
+                // Accept close-in readings too; filtering happens at decision points
+                if (d >= 2.0 && d < 200.0)
                     latestDistance = d;
                 else
                     latestDistance = 999;
 
+                latestDistanceMs = millis();
                 newReading = true;
                 usState = US_IDLE;
                 usTimer = micros();
@@ -662,7 +665,8 @@ void stopAndHalt() {
 }
 // Prefer the non-blocking ultrasonicTask() result where possible
 float latestUltrasoundCm() {
-  // `latestDistance` is updated by ultrasonicTask()
+  // If the reading is stale, treat as unknown/far
+  if (millis() - latestDistanceMs > 200) return 999;
   return latestDistance;
 }
 
@@ -737,6 +741,14 @@ void driveStraightUntilObstacle() {
   }
 
     distance = latestUltrasoundCm();
+    // ensure we have a recent reading before deciding
+    if (millis() - latestDistanceMs > 200) {
+      // force a quick update attempt
+      ultrasonicTask();
+      delay(10);
+      ultrasonicTask();
+      distance = latestUltrasoundCm();
+    }
     if (distance < 55.0) {
       turnRight90();
       parkingStart = millis();
@@ -760,6 +772,13 @@ void driveStraightUntilObstacle() {
      if (straightObstacle == false) {
       turnLeft20();
       distance = latestUltrasoundCm();
+      // ensure we have a recent reading before deciding
+      if (millis() - latestDistanceMs > 200) {
+        ultrasonicTask();
+        delay(10);
+        ultrasonicTask();
+        distance = latestUltrasoundCm();
+      }
       if (distance < 60.0) {
         turnRight20();
         turnRight90();
@@ -787,6 +806,13 @@ void driveStraightUntilObstacle() {
     if (straightObstacle == false && leftObstacle == false) {
       turnRight20();
       distance = latestUltrasoundCm();
+      // ensure we have a recent reading before deciding
+      if (millis() - latestDistanceMs > 200) {
+        ultrasonicTask();
+        delay(10);
+        ultrasonicTask();
+        distance = latestUltrasoundCm();
+      }
       if (distance < 60.0) {
         turnLeft20();
         turnLeft90();
@@ -812,22 +838,35 @@ void driveStraightUntilObstacle() {
       }
 
     while (true) {
+        // Keep ultrasonic updates flowing even during blocking parking loops
+        ultrasonicTask();
+
         distance = latestUltrasoundCm();
+
+        // If sensor is stale/unknown, be conservative: slow down
+        bool stale = (millis() - latestDistanceMs > 200);
+
         Serial.print("Distance (cm): ");
         Serial.println(distance);
 
-        if (distance <= 8.0) {
+        // Stop earlier to avoid barreling into obstacles (tune 12–20cm)
+        if (!stale && distance <= 15.0) {
             Brake(0);
             break;
         }
 
-        // Drive straight
+        // Drive straight (slow if stale)
         digitalWrite(motor1Phase, ACW);
         digitalWrite(motor2Phase, CW);
-        analogWrite(motor1PWM, 99);
-        analogWrite(motor2PWM, 100);
+        if (stale) {
+          analogWrite(motor1PWM, 60);
+          analogWrite(motor2PWM, 60);
+        } else {
+          analogWrite(motor1PWM, 99);
+          analogWrite(motor2PWM, 100);
+        }
 
-        delay(50); // small loop delay
+        delay(30); // smaller loop delay for faster reaction
         yield();
     }
 }
