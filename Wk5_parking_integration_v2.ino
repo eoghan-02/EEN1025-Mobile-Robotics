@@ -81,7 +81,7 @@ const int MAX_GRAPH_NODES = GN_COUNT;
 // CASE connections (0-indexed, 5 nodes)
 int adjacencyMatrix[MAX_GRAPH_NODES][MAX_GRAPH_NODES] = {
     // 0  1  2  3  4 A B
-    {0, 0, 0, 0, 0, 1, 0},
+    {0, 0, 0, 0, 1, 1, 0},
     {0, 0, 0, 0, 0, 1, 1},
     {0, 0, 0, 1, 0, 1, 0},
     {0, 0, 1, 0, 0, 0, 1},
